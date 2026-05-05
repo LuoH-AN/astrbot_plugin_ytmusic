@@ -1,11 +1,11 @@
 {
-  "proxy_suffix": {
-    "description": "反向代理后缀(必填,默认 .bot.luoh.org)。所有发往 *.youtube.com / *.googlevideo.com / *.ytimg.com / youtu.be 的请求都会改写到 <原域名><suffix>,由 Worker 反代到真实上游。设为空则禁用反代。",
+  "proxy_base": {
+    "description": "反向代理基址(路径式,默认 https://ytproxy.luoh.org)。所有发往 youtube.com / googlevideo.com / ytimg.com / youtu.be 的请求会改写成 <proxy_base>/<原域名>/<原路径>,由 Worker 反代。设为空则禁用反代。",
     "type": "string",
-    "default": ".bot.luoh.org"
+    "default": "https://ytproxy.luoh.org"
   },
   "proxy": {
-    "description": "兜底 HTTP/SOCKS 代理(可选),例如 http://127.0.0.1:7890。仅在 proxy_suffix 为空时给 ytmusicapi/yt-dlp 使用。",
+    "description": "兜底 HTTP/SOCKS 代理(可选),例如 http://127.0.0.1:7890。仅在 proxy_base 为空时生效。",
     "type": "string",
     "default": ""
   },

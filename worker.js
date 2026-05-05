@@ -1,5 +1,6 @@
 export default {
   async fetch(request, env, ctx) {
+    // ===== Mode 1: host -> host =====
     // incoming host -> upstream host (or full URL)
     const DOMAIN_MAP = {
       // Telegram Bot API
@@ -10,45 +11,70 @@ export default {
       "gateway.discord.bot.luoh.org": "gateway.discord.gg",
       "cdn.discord.bot.luoh.org": "cdn.discordapp.com",
       "media.discord.bot.luoh.org": "media.discordapp.net",
-
     };
 
-    // Wildcard mode: anything matching `<X>.bot.luoh.org` where the stem ends with
-    // (or equals) one of WILDCARD_TARGETS will be proxied to the stem itself.
-    // Example: rr5---sn-aigl6n7l.googlevideo.com.bot.luoh.org -> rr5---sn-aigl6n7l.googlevideo.com
-    // The allowlist exists so this worker can't be used as an open SSRF proxy.
+    // ===== Mode 2: wildcard subdomain -> host =====
+    // Anything matching `<X>.bot.luoh.org` whose stem ends with one of
+    // WILDCARD_TARGETS is proxied to the stem itself. Two-level subdomains
+    // are NOT covered by Universal SSL, so this mode requires Total TLS.
     const WILDCARD_SUFFIX = ".bot.luoh.org";
-    const WILDCARD_TARGETS = [
-      "youtube.com",
-      "googlevideo.com",
-      "ytimg.com",
-      "youtu.be",
-    ];
+    const WILDCARD_TARGETS = [];
+
+    // ===== Mode 3: single-host + path-based =====
+    // Request: https://ytproxy.luoh.org/<upstream_host>/<path>
+    //      -> https://<upstream_host>/<path>
+    // upstream_host must match one of the allowlisted suffixes for that
+    // incoming host. This works with Universal SSL (single-level subdomain).
+    const PATH_PROXY_HOSTS = {
+      "ytproxy.luoh.org": ["youtube.com", "googlevideo.com", "ytimg.com", "youtu.be"],
+    };
 
     const incomingUrl = new URL(request.url);
     const incomingHost = incomingUrl.hostname;
-    const target = resolveTarget(
-      DOMAIN_MAP[incomingHost] ||
-        resolveWildcard(incomingHost, WILDCARD_SUFFIX, WILDCARD_TARGETS),
-    );
+
+    let target = null;
+    let pathProxyPrefix = ""; // "/music.youtube.com" etc. — to strip from outgoing path
+    let pathProxyAllowed = null; // allowlist, for rewriting Location on redirect
+
+    // Try each mode in order:
+    target = resolveTarget(DOMAIN_MAP[incomingHost]);
+
+    if (!target) {
+      const stem = resolveWildcard(incomingHost, WILDCARD_SUFFIX, WILDCARD_TARGETS);
+      if (stem) target = resolveTarget(stem);
+    }
+
+    if (!target && PATH_PROXY_HOSTS[incomingHost]) {
+      const allowed = PATH_PROXY_HOSTS[incomingHost];
+      const parsed = parsePathProxy(incomingUrl.pathname, allowed);
+      if (parsed) {
+        target = resolveTarget(parsed.upstreamHost);
+        pathProxyPrefix = "/" + parsed.upstreamHost;
+        pathProxyAllowed = allowed;
+      }
+    }
 
     if (!target) {
       return json(
         {
           error: "No proxy rule matched",
           host: incomingHost,
-          available: Object.keys(DOMAIN_MAP),
-          wildcard: {
-            suffix: WILDCARD_SUFFIX,
-            allowed: WILDCARD_TARGETS,
+          modes: {
+            domainMap: Object.keys(DOMAIN_MAP),
+            wildcard: { suffix: WILDCARD_SUFFIX, allowed: WILDCARD_TARGETS },
+            pathProxy: PATH_PROXY_HOSTS,
           },
+          hint:
+            PATH_PROXY_HOSTS[incomingHost]
+              ? "Path format: https://" + incomingHost + "/<upstream_host>/<path>"
+              : undefined,
         },
         403,
         buildCorsHeaders(request),
       );
     }
 
-    // CORS preflight can return directly.
+    // CORS preflight.
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -56,7 +82,7 @@ export default {
       });
     }
 
-    const upstreamUrl = buildUpstreamUrl(incomingUrl, target);
+    const upstreamUrl = buildUpstreamUrl(incomingUrl, target, pathProxyPrefix);
 
     try {
       if (isWebSocketUpgrade(request)) {
@@ -93,6 +119,7 @@ export default {
         incomingUrl,
         upstreamUrl,
         targetHost: target.host,
+        pathProxyAllowed,
       });
       appendCorsHeaders(responseHeaders, request);
 
@@ -167,12 +194,32 @@ function resolveWildcard(host, suffix, targets) {
   return null;
 }
 
-function buildUpstreamUrl(incomingUrl, target) {
+function parsePathProxy(pathname, allowedSuffixes) {
+  const match = pathname.match(/^\/([^/]+)(\/.*)?$/);
+  if (!match) return null;
+  const candidate = match[1].toLowerCase();
+  if (!/^[a-z0-9.\-]+$/.test(candidate) || !candidate.includes(".")) {
+    return null; // not a plausible hostname
+  }
+  for (const t of allowedSuffixes) {
+    if (candidate === t || candidate.endsWith("." + t)) {
+      return { upstreamHost: candidate, rest: match[2] || "/" };
+    }
+  }
+  return null;
+}
+
+function buildUpstreamUrl(incomingUrl, target, stripPrefix = "") {
   const upstream = new URL(incomingUrl.toString());
   upstream.protocol = target.protocol;
   upstream.hostname = target.host;
   upstream.port = target.port;
-  upstream.pathname = joinPaths(target.basePath, incomingUrl.pathname);
+
+  let path = incomingUrl.pathname;
+  if (stripPrefix && path.startsWith(stripPrefix)) {
+    path = path.slice(stripPrefix.length) || "/";
+  }
+  upstream.pathname = joinPaths(target.basePath, path);
   return upstream;
 }
 
@@ -219,7 +266,7 @@ function buildProxyHeaders(headers, { websocket, incomingHost, incomingProto }) 
   return outgoing;
 }
 
-function rewriteLocationHeader(headers, { incomingUrl, upstreamUrl, targetHost }) {
+function rewriteLocationHeader(headers, { incomingUrl, upstreamUrl, targetHost, pathProxyAllowed }) {
   const rawLocation = headers.get("Location");
   if (!rawLocation) {
     return;
@@ -232,10 +279,30 @@ function rewriteLocationHeader(headers, { incomingUrl, upstreamUrl, targetHost }
     return;
   }
 
-  if (location.hostname !== targetHost) {
+  // Path-proxy mode: if upstream redirects to any allowlisted host (including
+  // a different one like www.youtube.com -> music.youtube.com), rewrite it so
+  // the client keeps going through us instead of bypassing the proxy.
+  if (pathProxyAllowed) {
+    const h = location.hostname;
+    const allowed = pathProxyAllowed.some(
+      (t) => h === t || h.endsWith("." + t),
+    );
+    if (allowed) {
+      const newPath = "/" + h + (location.pathname === "/" ? "" : location.pathname);
+      const rebuilt = new URL(incomingUrl.toString());
+      rebuilt.pathname = newPath;
+      rebuilt.search = location.search;
+      rebuilt.hash = location.hash;
+      headers.set("Location", rebuilt.toString());
+    }
     return;
   }
 
+  // Domain-map / wildcard mode: only rewrite when upstream redirects to the
+  // same target host.
+  if (location.hostname !== targetHost) {
+    return;
+  }
   location.protocol = incomingUrl.protocol;
   location.hostname = incomingUrl.hostname;
   location.port = incomingUrl.port;

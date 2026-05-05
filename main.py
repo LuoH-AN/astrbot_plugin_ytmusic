@@ -9,57 +9,64 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Plain, Record, Image
 
-# 这些主机名(以及它们的子域)会被改写到 worker 反代。
-# 必须与 worker.js 里的 WILDCARD_TARGETS 保持一致。
+# 这些主机名(以及它们的子域)会被改写到反代。
+# 必须与 worker.js 里 PATH_PROXY_HOSTS 的 allowlist 保持一致。
 _PROXY_TARGETS = ("youtube.com", "googlevideo.com", "ytimg.com", "youtu.be")
 
 
-def _make_host_rewriter(proxy_suffix: str) -> Callable[[str], Optional[str]]:
-    """返回一个函数:原 host -> 反代 host(若不在反代范围内返回 None)。"""
-    if not proxy_suffix:
-        return lambda _h: None
-    suffix = proxy_suffix if proxy_suffix.startswith(".") else "." + proxy_suffix
-    suffix = suffix.rstrip("/")
+def _make_url_rewriter(proxy_base: str) -> Callable[[str], Optional[str]]:
+    """返回一个函数:原 URL -> 反代 URL(若不在反代范围内返回 None)。
+    路径式反代:https://host/path?q -> <proxy_base>/host/path?q
+    """
+    if not proxy_base:
+        return lambda _u: None
 
-    def rewrite(host: str) -> Optional[str]:
-        if not host:
-            return None
-        for t in _PROXY_TARGETS:
-            if host == t or host.endswith("." + t):
-                return host + suffix
-        return None
-
-    return rewrite
-
-
-def _rewrite_url(url: str, rewriter: Callable[[str], Optional[str]]) -> Optional[str]:
     from urllib.parse import urlparse, urlunparse
 
-    u = urlparse(url)
-    new_host = rewriter(u.hostname or "")
-    if not new_host:
-        return None
-    netloc = f"{new_host}:{u.port}" if u.port else new_host
-    return urlunparse(u._replace(scheme="https", netloc=netloc))
+    base = proxy_base.strip()
+    if "://" not in base:
+        base = "https://" + base
+    base = base.rstrip("/")
+    parsed_base = urlparse(base)
+    base_scheme = parsed_base.scheme or "https"
+    base_netloc = parsed_base.netloc
+    base_path = parsed_base.path  # 可能为空
+
+    def rewrite(url: str) -> Optional[str]:
+        if not url:
+            return None
+        u = urlparse(url)
+        host = (u.hostname or "").lower()
+        if not host:
+            return None
+        if not any(host == t or host.endswith("." + t) for t in _PROXY_TARGETS):
+            return None
+        # 把原 host 作为 proxy_base 的首段路径
+        new_path = base_path + "/" + host + (u.path or "/")
+        # 避免 // 连在一起
+        new_path = re.sub(r"/+", "/", new_path)
+        return urlunparse((base_scheme, base_netloc, new_path, u.params, u.query, u.fragment))
+
+    return rewrite
 
 
 @register(
     "astrbot_plugin_ytmusic",
     "LuoH-AN",
     "通过 YouTube Music 点歌的插件,使用 `点歌 歌名` 触发",
-    "1.2.0",
+    "1.3.0",
 )
 class YTMusicPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
-        self.proxy_suffix: str = (self.config.get("proxy_suffix") or "").strip()
+        self.proxy_base: str = (self.config.get("proxy_base") or "").strip().rstrip("/")
         self.proxy: Optional[str] = self.config.get("proxy") or os.environ.get("HTTPS_PROXY")
         self.send_card: bool = bool(self.config.get("send_card", True))
         self.send_audio: bool = bool(self.config.get("send_audio", True))
         self.max_duration: int = int(self.config.get("max_duration", 600))
 
-        self._rewrite_host = _make_host_rewriter(self.proxy_suffix)
+        self._rewrite_url = _make_url_rewriter(self.proxy_base)
         self.ytm = self._init_ytmusic()
 
     def _init_ytmusic(self):
@@ -72,9 +79,9 @@ class YTMusicPlugin(Star):
             import requests
 
             session = requests.Session()
-            if self.proxy_suffix:
-                _patch_requests_session(session, self._rewrite_host)
-                logger.info(f"[ytmusic] ytmusicapi 走反代后缀: {self.proxy_suffix}")
+            if self.proxy_base:
+                _patch_requests_session(session, self._rewrite_url, self.proxy_base)
+                logger.info(f"[ytmusic] ytmusicapi 走反代: {self.proxy_base}")
             elif self.proxy:
                 session.proxies.update({"http": self.proxy, "https": self.proxy})
             return YTMusic(requests_session=session)
@@ -128,7 +135,7 @@ class YTMusicPlugin(Star):
             f"链接:{play_url}"
         )
 
-        # 缩略图也走反代,否则下游 image 渲染可能拉不到
+        # 缩略图也走反代,否则下游 image 渲染可能拉不到 i.ytimg.com
         chain = []
         if thumbnail:
             chain.append(Image.fromURL(self._maybe_rewrite(thumbnail)))
@@ -156,9 +163,9 @@ class YTMusicPlugin(Star):
                 yield event.plain_result(f"音频下载失败:{e}")
 
     def _maybe_rewrite(self, url: str) -> str:
-        if not self.proxy_suffix:
+        if not self.proxy_base:
             return url
-        new_url = _rewrite_url(url, self._rewrite_host)
+        new_url = self._rewrite_url(url)
         return new_url or url
 
     def _search_song(self, keyword: str) -> Optional[dict]:
@@ -182,8 +189,8 @@ class YTMusicPlugin(Star):
             logger.error("[ytmusic] 未安装 yt-dlp,请执行: pip install yt-dlp")
             return None
 
-        if self.proxy_suffix:
-            _install_yt_dlp_patch(self._rewrite_host)
+        if self.proxy_base:
+            _install_yt_dlp_patch(self._rewrite_url)
 
         tmp_dir = tempfile.gettempdir()
         outtmpl = os.path.join(tmp_dir, f"ytm_{video_id}.%(ext)s")
@@ -201,8 +208,7 @@ class YTMusicPlugin(Star):
                 }
             ],
         }
-        # 仅当未启用反代时,才把 HTTP 代理给 yt_dlp
-        if not self.proxy_suffix and self.proxy:
+        if not self.proxy_base and self.proxy:
             ydl_opts["proxy"] = self.proxy
 
         url = f"https://music.youtube.com/watch?v={video_id}"
@@ -236,7 +242,6 @@ class YTMusicPlugin(Star):
             return
 
         client = event.bot
-        # 卡片里的 URL 给最终用户点击,保持真实地址
         play_url = f"https://music.youtube.com/watch?v={video_id}"
         payload = [
             {
@@ -289,27 +294,27 @@ class YTMusicPlugin(Star):
         logger.info("[ytmusic] 插件已卸载")
 
 
-def _patch_requests_session(session, rewriter: Callable[[str], Optional[str]]) -> None:
-    """让 requests.Session 在发包前把命中的 URL 改写到反代。"""
+def _patch_requests_session(session, rewriter: Callable[[str], Optional[str]], proxy_base: str) -> None:
+    """让 requests.Session 在发包前把命中的 URL 改写到反代路径式。"""
+    from urllib.parse import urlparse
+
+    proxy_host = urlparse(proxy_base if "://" in proxy_base else "https://" + proxy_base).hostname
     original_send = session.send
 
     def send(request, **kwargs):
-        new_url = _rewrite_url(request.url, rewriter)
+        new_url = rewriter(request.url)
         if new_url:
-            from urllib.parse import urlparse
-
             request.url = new_url
-            new_host = urlparse(new_url).hostname or ""
-            # Host 头要换,否则 SNI / 虚拟主机会错
-            request.headers["Host"] = new_host
+            # Host 头换成反代主机,否则 TLS SNI / 虚拟主机匹配会错
+            if proxy_host:
+                request.headers["Host"] = proxy_host
         return original_send(request, **kwargs)
 
     session.send = send
 
 
 def _install_yt_dlp_patch(rewriter: Callable[[str], Optional[str]]) -> None:
-    """对 yt_dlp 的 RequestDirector.send 打补丁,把出站 URL 全部走反代。
-    幂等:重复调用不会叠加多层 wrapper。"""
+    """对 yt_dlp 的 RequestDirector.send 打补丁,把出站 URL 全部走反代。幂等。"""
     try:
         from yt_dlp.networking.common import RequestDirector
     except Exception as e:
@@ -317,8 +322,6 @@ def _install_yt_dlp_patch(rewriter: Callable[[str], Optional[str]]) -> None:
         return
 
     if getattr(RequestDirector.send, "_ytm_proxy_patched", False):
-        # 已经被 patch 过了。即便 rewriter 不一样,也用最新的——下面 closure 会引用最新值。
-        # 这里通过把 rewriter 写到类属性来动态切换。
         RequestDirector._ytm_rewriter = rewriter
         return
 
@@ -328,15 +331,10 @@ def _install_yt_dlp_patch(rewriter: Callable[[str], Optional[str]]) -> None:
     def patched_send(self, request):
         rw = getattr(RequestDirector, "_ytm_rewriter", None)
         if rw is not None:
-            new_url = _rewrite_url(request.url, rw)
+            new_url = rw(request.url)
             if new_url:
-                from urllib.parse import urlparse
-
                 request.url = new_url
-                new_host = urlparse(new_url).hostname or ""
-                if hasattr(request, "headers") and request.headers is not None:
-                    # yt_dlp 的 headers 是 dict-like,大小写不敏感
-                    request.headers["Host"] = new_host
+                # yt_dlp 的 Request 对象从 url 推导 Host,不需要手动改 header
         return original_send(self, request)
 
     patched_send._ytm_proxy_patched = True
