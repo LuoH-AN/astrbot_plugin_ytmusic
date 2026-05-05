@@ -412,8 +412,34 @@ def _install_yt_dlp_patch(rewriter: Callable[[str], Optional[str]]) -> None:
         if rw is not None:
             new_url = rw(request.url)
             if new_url:
+                # 必须在改 URL *之前* 把 cookies 算好塞进 Cookie 头。
+                # 否则 urllib 的 HTTPCookieProcessor 会按改写后的 URL(ytproxy.luoh.org)
+                # 找匹配 cookies,而 cookies.txt 里的 cookie domain 都是 .youtube.com,
+                # 匹配失败 -> 请求变成匿名 -> YT 反爬。
+                #
+                # cookiejar 来源:
+                # 1. request.extensions["cookiejar"] — per-request override
+                # 2. handler.cookiejar — 全局 cookiejar (从 cookiefile 加载)
+                # 复刻 yt_dlp/networking/common.py: RequestHandler._get_cookiejar 的逻辑
+                try:
+                    import urllib.request as _ur
+
+                    cookiejar = request.extensions.get("cookiejar") if request.extensions else None
+                    if cookiejar is None:
+                        # 从 handlers 里找 Urllib handler,拿它的 cookiejar
+                        for h in getattr(self, "handlers", {}).values():
+                            if getattr(h, "RH_NAME", "") == "Urllib":
+                                cookiejar = getattr(h, "cookiejar", None)
+                                break
+                    if cookiejar is not None:
+                        fake = _ur.Request(request.url)
+                        cookiejar.add_cookie_header(fake)
+                        cookie_hdr = fake.get_header("Cookie")
+                        if cookie_hdr:
+                            request.headers["Cookie"] = cookie_hdr
+                except Exception as e:
+                    logger.debug(f"[ytmusic] 预注入 cookies 失败: {e}")
                 request.url = new_url
-                # yt_dlp 的 Request 对象从 url 推导 Host,不需要手动改 header
         return original_send(self, request)
 
     patched_send._ytm_proxy_patched = True
