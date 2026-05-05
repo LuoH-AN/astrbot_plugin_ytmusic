@@ -13,13 +13,14 @@ from astrbot.api.message_components import Plain, Record, Image
     "astrbot_plugin_ytmusic",
     "LuoH-AN",
     "通过 YouTube Music 点歌的插件,使用 `点歌 歌名` 触发",
-    "1.0.1",
+    "1.1.0",
 )
 class YTMusicPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
         self.proxy: Optional[str] = self.config.get("proxy") or os.environ.get("HTTPS_PROXY")
+        self.ytm_proxy_base: str = (self.config.get("ytm_proxy_base") or "").strip()
         self.send_card: bool = bool(self.config.get("send_card", True))
         self.send_audio: bool = bool(self.config.get("send_audio", True))
         self.max_duration: int = int(self.config.get("max_duration", 600))
@@ -33,12 +34,16 @@ class YTMusicPlugin(Star):
             logger.error("[ytmusic] 未安装 ytmusicapi,请执行: pip install ytmusicapi")
             return None
         try:
+            import requests
+            session = requests.Session()
             if self.proxy:
-                import requests
-                session = requests.Session()
                 session.proxies.update({"http": self.proxy, "https": self.proxy})
-                return YTMusic(requests_session=session)
-            return YTMusic()
+            if self.ytm_proxy_base:
+                adapter = _YTMProxyAdapter(self.ytm_proxy_base)
+                session.mount("https://music.youtube.com/", adapter)
+                session.mount("http://music.youtube.com/", adapter)
+                logger.info(f"[ytmusic] 已启用反向代理: {self.ytm_proxy_base}")
+            return YTMusic(requests_session=session)
         except Exception as e:
             logger.error(f"[ytmusic] 初始化 YTMusic 失败: {e}")
             return None
@@ -235,3 +240,37 @@ class YTMusicPlugin(Star):
 
     async def terminate(self):
         logger.info("[ytmusic] 插件已卸载")
+
+
+try:
+    from requests.adapters import HTTPAdapter as _HTTPAdapter
+except Exception:  # requests is a hard dep of ytmusicapi; this is just defensive
+    _HTTPAdapter = object  # type: ignore[misc,assignment]
+
+
+class _YTMProxyAdapter(_HTTPAdapter):
+    """把发往 music.youtube.com 的请求重写到反向代理基址。"""
+
+    def __init__(self, proxy_base: str, *args, **kwargs):
+        from urllib.parse import urlparse
+
+        if "://" not in proxy_base:
+            proxy_base = "https://" + proxy_base
+        p = urlparse(proxy_base.rstrip("/"))
+        self._scheme = p.scheme or "https"
+        self._netloc = p.netloc
+        self._path_prefix = p.path  # 可能为空字符串
+        super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        from urllib.parse import urlparse, urlunparse
+
+        u = urlparse(request.url)
+        new_path = (self._path_prefix + u.path) if self._path_prefix else u.path
+        new_url = urlunparse(
+            (self._scheme, self._netloc, new_path or "/", u.params, u.query, u.fragment)
+        )
+        request.url = new_url
+        # Host 头需要改成反代主机,否则 TLS SNI / 虚拟主机会出错
+        request.headers["Host"] = self._netloc
+        return super().send(request, **kwargs)
