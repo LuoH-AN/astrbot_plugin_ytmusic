@@ -2,29 +2,64 @@ import asyncio
 import os
 import re
 import tempfile
-from typing import Optional
+from typing import Callable, Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Plain, Record, Image
 
+# 这些主机名(以及它们的子域)会被改写到 worker 反代。
+# 必须与 worker.js 里的 WILDCARD_TARGETS 保持一致。
+_PROXY_TARGETS = ("youtube.com", "googlevideo.com", "ytimg.com", "youtu.be")
+
+
+def _make_host_rewriter(proxy_suffix: str) -> Callable[[str], Optional[str]]:
+    """返回一个函数:原 host -> 反代 host(若不在反代范围内返回 None)。"""
+    if not proxy_suffix:
+        return lambda _h: None
+    suffix = proxy_suffix if proxy_suffix.startswith(".") else "." + proxy_suffix
+    suffix = suffix.rstrip("/")
+
+    def rewrite(host: str) -> Optional[str]:
+        if not host:
+            return None
+        for t in _PROXY_TARGETS:
+            if host == t or host.endswith("." + t):
+                return host + suffix
+        return None
+
+    return rewrite
+
+
+def _rewrite_url(url: str, rewriter: Callable[[str], Optional[str]]) -> Optional[str]:
+    from urllib.parse import urlparse, urlunparse
+
+    u = urlparse(url)
+    new_host = rewriter(u.hostname or "")
+    if not new_host:
+        return None
+    netloc = f"{new_host}:{u.port}" if u.port else new_host
+    return urlunparse(u._replace(scheme="https", netloc=netloc))
+
+
 @register(
     "astrbot_plugin_ytmusic",
     "LuoH-AN",
     "通过 YouTube Music 点歌的插件,使用 `点歌 歌名` 触发",
-    "1.1.0",
+    "1.2.0",
 )
 class YTMusicPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
+        self.proxy_suffix: str = (self.config.get("proxy_suffix") or "").strip()
         self.proxy: Optional[str] = self.config.get("proxy") or os.environ.get("HTTPS_PROXY")
-        self.ytm_proxy_base: str = (self.config.get("ytm_proxy_base") or "").strip()
         self.send_card: bool = bool(self.config.get("send_card", True))
         self.send_audio: bool = bool(self.config.get("send_audio", True))
         self.max_duration: int = int(self.config.get("max_duration", 600))
 
+        self._rewrite_host = _make_host_rewriter(self.proxy_suffix)
         self.ytm = self._init_ytmusic()
 
     def _init_ytmusic(self):
@@ -35,14 +70,13 @@ class YTMusicPlugin(Star):
             return None
         try:
             import requests
+
             session = requests.Session()
-            if self.proxy:
+            if self.proxy_suffix:
+                _patch_requests_session(session, self._rewrite_host)
+                logger.info(f"[ytmusic] ytmusicapi 走反代后缀: {self.proxy_suffix}")
+            elif self.proxy:
                 session.proxies.update({"http": self.proxy, "https": self.proxy})
-            if self.ytm_proxy_base:
-                adapter = _YTMProxyAdapter(self.ytm_proxy_base)
-                session.mount("https://music.youtube.com/", adapter)
-                session.mount("http://music.youtube.com/", adapter)
-                logger.info(f"[ytmusic] 已启用反向代理: {self.ytm_proxy_base}")
             return YTMusic(requests_session=session)
         except Exception as e:
             logger.error(f"[ytmusic] 初始化 YTMusic 失败: {e}")
@@ -94,9 +128,10 @@ class YTMusicPlugin(Star):
             f"链接:{play_url}"
         )
 
+        # 缩略图也走反代,否则下游 image 渲染可能拉不到
         chain = []
         if thumbnail:
-            chain.append(Image.fromURL(thumbnail))
+            chain.append(Image.fromURL(self._maybe_rewrite(thumbnail)))
         chain.append(Plain(info_text))
         yield event.chain_result(chain)
 
@@ -117,8 +152,14 @@ class YTMusicPlugin(Star):
                 else:
                     yield event.plain_result("音频文件下载失败,可能是网络/版权问题。")
             except Exception as e:
-                logger.exception("[ytmusic] 下载音频失败")
+                logger.warning(f"[ytmusic] 下载音频失败: {e}")
                 yield event.plain_result(f"音频下载失败:{e}")
+
+    def _maybe_rewrite(self, url: str) -> str:
+        if not self.proxy_suffix:
+            return url
+        new_url = _rewrite_url(url, self._rewrite_host)
+        return new_url or url
 
     def _search_song(self, keyword: str) -> Optional[dict]:
         results = self.ytm.search(keyword, filter="songs", limit=5)
@@ -140,6 +181,10 @@ class YTMusicPlugin(Star):
         except ImportError:
             logger.error("[ytmusic] 未安装 yt-dlp,请执行: pip install yt-dlp")
             return None
+
+        if self.proxy_suffix:
+            _install_yt_dlp_patch(self._rewrite_host)
+
         tmp_dir = tempfile.gettempdir()
         outtmpl = os.path.join(tmp_dir, f"ytm_{video_id}.%(ext)s")
         ydl_opts = {
@@ -156,7 +201,8 @@ class YTMusicPlugin(Star):
                 }
             ],
         }
-        if self.proxy:
+        # 仅当未启用反代时,才把 HTTP 代理给 yt_dlp
+        if not self.proxy_suffix and self.proxy:
             ydl_opts["proxy"] = self.proxy
 
         url = f"https://music.youtube.com/watch?v={video_id}"
@@ -190,6 +236,7 @@ class YTMusicPlugin(Star):
             return
 
         client = event.bot
+        # 卡片里的 URL 给最终用户点击,保持真实地址
         play_url = f"https://music.youtube.com/watch?v={video_id}"
         payload = [
             {
@@ -242,35 +289,56 @@ class YTMusicPlugin(Star):
         logger.info("[ytmusic] 插件已卸载")
 
 
-try:
-    from requests.adapters import HTTPAdapter as _HTTPAdapter
-except Exception:  # requests is a hard dep of ytmusicapi; this is just defensive
-    _HTTPAdapter = object  # type: ignore[misc,assignment]
+def _patch_requests_session(session, rewriter: Callable[[str], Optional[str]]) -> None:
+    """让 requests.Session 在发包前把命中的 URL 改写到反代。"""
+    original_send = session.send
+
+    def send(request, **kwargs):
+        new_url = _rewrite_url(request.url, rewriter)
+        if new_url:
+            from urllib.parse import urlparse
+
+            request.url = new_url
+            new_host = urlparse(new_url).hostname or ""
+            # Host 头要换,否则 SNI / 虚拟主机会错
+            request.headers["Host"] = new_host
+        return original_send(request, **kwargs)
+
+    session.send = send
 
 
-class _YTMProxyAdapter(_HTTPAdapter):
-    """把发往 music.youtube.com 的请求重写到反向代理基址。"""
+def _install_yt_dlp_patch(rewriter: Callable[[str], Optional[str]]) -> None:
+    """对 yt_dlp 的 RequestDirector.send 打补丁,把出站 URL 全部走反代。
+    幂等:重复调用不会叠加多层 wrapper。"""
+    try:
+        from yt_dlp.networking.common import RequestDirector
+    except Exception as e:
+        logger.warning(f"[ytmusic] 无法 patch yt_dlp(可能版本过旧): {e}")
+        return
 
-    def __init__(self, proxy_base: str, *args, **kwargs):
-        from urllib.parse import urlparse
+    if getattr(RequestDirector.send, "_ytm_proxy_patched", False):
+        # 已经被 patch 过了。即便 rewriter 不一样,也用最新的——下面 closure 会引用最新值。
+        # 这里通过把 rewriter 写到类属性来动态切换。
+        RequestDirector._ytm_rewriter = rewriter
+        return
 
-        if "://" not in proxy_base:
-            proxy_base = "https://" + proxy_base
-        p = urlparse(proxy_base.rstrip("/"))
-        self._scheme = p.scheme or "https"
-        self._netloc = p.netloc
-        self._path_prefix = p.path  # 可能为空字符串
-        super().__init__(*args, **kwargs)
+    original_send = RequestDirector.send
+    RequestDirector._ytm_rewriter = rewriter
 
-    def send(self, request, **kwargs):
-        from urllib.parse import urlparse, urlunparse
+    def patched_send(self, request):
+        rw = getattr(RequestDirector, "_ytm_rewriter", None)
+        if rw is not None:
+            new_url = _rewrite_url(request.url, rw)
+            if new_url:
+                from urllib.parse import urlparse
 
-        u = urlparse(request.url)
-        new_path = (self._path_prefix + u.path) if self._path_prefix else u.path
-        new_url = urlunparse(
-            (self._scheme, self._netloc, new_path or "/", u.params, u.query, u.fragment)
-        )
-        request.url = new_url
-        # Host 头需要改成反代主机,否则 TLS SNI / 虚拟主机会出错
-        request.headers["Host"] = self._netloc
-        return super().send(request, **kwargs)
+                request.url = new_url
+                new_host = urlparse(new_url).hostname or ""
+                if hasattr(request, "headers") and request.headers is not None:
+                    # yt_dlp 的 headers 是 dict-like,大小写不敏感
+                    request.headers["Host"] = new_host
+        return original_send(self, request)
+
+    patched_send._ytm_proxy_patched = True
+    RequestDirector.send = patched_send
+    logger.info("[ytmusic] 已为 yt_dlp 安装反代 URL 重写补丁")

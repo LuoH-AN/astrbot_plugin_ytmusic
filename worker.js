@@ -11,14 +11,26 @@ export default {
       "cdn.discord.bot.luoh.org": "cdn.discordapp.com",
       "media.discord.bot.luoh.org": "media.discordapp.net",
 
-      // YouTube Music (for ytmusicapi)
-      "music.youtube.bot.luoh.org": "music.youtube.com",
-
     };
+
+    // Wildcard mode: anything matching `<X>.bot.luoh.org` where the stem ends with
+    // (or equals) one of WILDCARD_TARGETS will be proxied to the stem itself.
+    // Example: rr5---sn-aigl6n7l.googlevideo.com.bot.luoh.org -> rr5---sn-aigl6n7l.googlevideo.com
+    // The allowlist exists so this worker can't be used as an open SSRF proxy.
+    const WILDCARD_SUFFIX = ".bot.luoh.org";
+    const WILDCARD_TARGETS = [
+      "youtube.com",
+      "googlevideo.com",
+      "ytimg.com",
+      "youtu.be",
+    ];
 
     const incomingUrl = new URL(request.url);
     const incomingHost = incomingUrl.hostname;
-    const target = resolveTarget(DOMAIN_MAP[incomingHost]);
+    const target = resolveTarget(
+      DOMAIN_MAP[incomingHost] ||
+        resolveWildcard(incomingHost, WILDCARD_SUFFIX, WILDCARD_TARGETS),
+    );
 
     if (!target) {
       return json(
@@ -26,6 +38,10 @@ export default {
           error: "No proxy rule matched",
           host: incomingHost,
           available: Object.keys(DOMAIN_MAP),
+          wildcard: {
+            suffix: WILDCARD_SUFFIX,
+            allowed: WILDCARD_TARGETS,
+          },
         },
         403,
         buildCorsHeaders(request),
@@ -136,6 +152,19 @@ function resolveTarget(raw) {
     port: parsed.port || "",
     basePath: parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, ""),
   };
+}
+
+function resolveWildcard(host, suffix, targets) {
+  if (!host.endsWith(suffix)) {
+    return null;
+  }
+  const stem = host.slice(0, -suffix.length);
+  for (const t of targets) {
+    if (stem === t || stem.endsWith("." + t)) {
+      return stem;
+    }
+  }
+  return null;
 }
 
 function buildUpstreamUrl(incomingUrl, target) {

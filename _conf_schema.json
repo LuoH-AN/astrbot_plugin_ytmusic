@@ -1,13 +1,13 @@
 {
+  "proxy_suffix": {
+    "description": "反向代理后缀(必填,默认 .bot.luoh.org)。所有发往 *.youtube.com / *.googlevideo.com / *.ytimg.com / youtu.be 的请求都会改写到 <原域名><suffix>,由 Worker 反代到真实上游。设为空则禁用反代。",
+    "type": "string",
+    "default": ".bot.luoh.org"
+  },
   "proxy": {
-    "description": "HTTP/HTTPS 网络代理(可选),例如 http://127.0.0.1:7890。会传给 ytmusicapi 与 yt-dlp。",
+    "description": "兜底 HTTP/SOCKS 代理(可选),例如 http://127.0.0.1:7890。仅在 proxy_suffix 为空时给 ytmusicapi/yt-dlp 使用。",
     "type": "string",
     "default": ""
-  },
-  "ytm_proxy_base": {
-    "description": "music.youtube.com 反向代理基址(可选),例如 https://music.youtube.bot.luoh.org。设置后 ytmusicapi 的所有请求会改走该地址,优先级高于 proxy(yt-dlp 仍走 proxy)。",
-    "type": "string",
-    "default": "https://music.youtube.bot.luoh.org/"
   },
   "send_card": {
     "description": "是否尝试发送 QQ 音乐卡片(仅 aiocqhttp 平台,部分协议端不支持)",
