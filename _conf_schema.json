@@ -1,0 +1,22 @@
+{
+  "proxy": {
+    "description": "网络代理(可选),例如 http://127.0.0.1:7890。用于访问 YouTube Music。",
+    "type": "string",
+    "default": ""
+  },
+  "send_card": {
+    "description": "是否尝试发送 QQ 音乐卡片(仅 aiocqhttp 平台,部分协议端不支持)",
+    "type": "bool",
+    "default": true
+  },
+  "send_audio": {
+    "description": "是否下载并发送音频文件(需安装 yt-dlp 与 ffmpeg)",
+    "type": "bool",
+    "default": true
+  },
+  "max_duration": {
+    "description": "允许下载发送的最大歌曲时长(秒),超过则跳过音频下载",
+    "type": "int",
+    "default": 600
+  }
+}

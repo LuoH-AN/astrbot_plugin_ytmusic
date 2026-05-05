@@ -1,0 +1,5 @@
+name: astrbot_plugin_ytmusic
+desc: 通过 YouTube Music 点歌的 AstrBot 插件,使用 `点歌 歌名` 触发
+version: 1.0.0
+author: AstrBot User
+repo: https://github.com/your/astrbot_plugin_ytmusic

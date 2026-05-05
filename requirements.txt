@@ -1,0 +1,2 @@
+ytmusicapi>=1.7.0
+yt-dlp>=2024.8.6
