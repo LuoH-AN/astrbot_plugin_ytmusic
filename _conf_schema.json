@@ -7,7 +7,7 @@
   "ytm_proxy_base": {
     "description": "music.youtube.com 反向代理基址(可选),例如 https://music.youtube.bot.luoh.org。设置后 ytmusicapi 的所有请求会改走该地址,优先级高于 proxy(yt-dlp 仍走 proxy)。",
     "type": "string",
-    "default": ""
+    "default": "https://music.youtube.bot.luoh.org/"
   },
   "send_card": {
     "description": "是否尝试发送 QQ 音乐卡片(仅 aiocqhttp 平台,部分协议端不支持)",
