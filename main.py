@@ -258,11 +258,28 @@ class YTMusicPlugin(Star):
         try:
             import requests
 
-            resp = requests.get(src, timeout=15)
+            resp = requests.get(
+                src,
+                timeout=20,
+                allow_redirects=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                    "Accept": "text/plain, */*;q=0.5",
+                },
+            )
             resp.raise_for_status()
             content = resp.content
         except Exception as e:
-            logger.warning(f"[ytmusic] 拉取 cookies URL 失败: {e}")
+            # 截断最终 URL,避免签名链刷屏
+            final_url = ""
+            try:
+                final_url = getattr(e, "response", None).url if getattr(e, "response", None) else ""
+            except Exception:
+                pass
+            if final_url and len(final_url) > 200:
+                final_url = final_url[:200] + "...(truncated)"
+            logger.warning(f"[ytmusic] 拉取 cookies URL 失败: {type(e).__name__}: {e.__class__.__name__} src={src} final={final_url}")
             # 拉取失败但之前有缓存,降级用旧的
             if cache and os.path.exists(cache):
                 return cache
