@@ -54,7 +54,7 @@ def _make_url_rewriter(proxy_base: str) -> Callable[[str], Optional[str]]:
     "astrbot_plugin_ytmusic",
     "LuoH-AN",
     "通过 YouTube Music 点歌的插件,使用 `点歌 歌名` 触发",
-    "1.3.0",
+    "1.3.1",
 )
 class YTMusicPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -65,6 +65,7 @@ class YTMusicPlugin(Star):
         self.send_card: bool = bool(self.config.get("send_card", True))
         self.send_audio: bool = bool(self.config.get("send_audio", True))
         self.max_duration: int = int(self.config.get("max_duration", 600))
+        self.cookies_file: str = (self.config.get("cookies_file") or "").strip()
 
         self._rewrite_url = _make_url_rewriter(self.proxy_base)
         self.ytm = self._init_ytmusic()
@@ -210,6 +211,12 @@ class YTMusicPlugin(Star):
         }
         if not self.proxy_base and self.proxy:
             ydl_opts["proxy"] = self.proxy
+
+        if self.cookies_file:
+            if os.path.exists(self.cookies_file):
+                ydl_opts["cookiefile"] = self.cookies_file
+            else:
+                logger.warning(f"[ytmusic] cookies_file 不存在: {self.cookies_file}")
 
         url = f"https://music.youtube.com/watch?v={video_id}"
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

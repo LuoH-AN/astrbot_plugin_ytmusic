@@ -9,6 +9,11 @@
     "type": "string",
     "default": ""
   },
+  "cookies_file": {
+    "description": "YouTube cookies 文件路径(Netscape 格式),例如 /root/music/cookies.txt。yt-dlp 用它绕过『Sign in to confirm you're not a bot』。导出方法见 yt-dlp wiki(浏览器装 'Get cookies.txt LOCALLY' 扩展,在已登录 youtube.com 上导出)。",
+    "type": "string",
+    "default": ""
+  },
   "send_card": {
     "description": "是否尝试发送 QQ 音乐卡片(仅 aiocqhttp 平台,部分协议端不支持)",
     "type": "bool",
