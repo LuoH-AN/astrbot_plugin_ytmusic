@@ -10,9 +10,14 @@
     "default": ""
   },
   "cookies_file": {
-    "description": "YouTube cookies 文件路径(Netscape 格式),默认 /AstrBot/data/music.youtube.com_cookies.txt。yt-dlp 用它绕过『Sign in to confirm you're not a bot』。导出方法见 yt-dlp wiki(浏览器装 'Get cookies.txt LOCALLY' 扩展,在已登录 youtube.com 上导出)。",
+    "description": "YouTube cookies 来源(Netscape 格式)。可填:1) 本地路径,如 /AstrBot/data/music.youtube.com_cookies.txt;2) http(s) URL,会自动下载并缓存到临时目录。yt-dlp 用它绕过『Sign in to confirm you're not a bot』。",
     "type": "string",
     "default": "/AstrBot/data/music.youtube.com_cookies.txt"
+  },
+  "cookies_refresh_seconds": {
+    "description": "当 cookies_file 是 URL 时,本地缓存的有效期(秒),默认 3600。超过则重新下载。",
+    "type": "int",
+    "default": 3600
   },
   "send_card": {
     "description": "是否尝试发送 QQ 音乐卡片(仅 aiocqhttp 平台,部分协议端不支持)",

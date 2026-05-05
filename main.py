@@ -54,7 +54,7 @@ def _make_url_rewriter(proxy_base: str) -> Callable[[str], Optional[str]]:
     "astrbot_plugin_ytmusic",
     "LuoH-AN",
     "通过 YouTube Music 点歌的插件,使用 `点歌 歌名` 触发",
-    "1.3.1",
+    "1.4.0",
 )
 class YTMusicPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -66,6 +66,9 @@ class YTMusicPlugin(Star):
         self.send_audio: bool = bool(self.config.get("send_audio", True))
         self.max_duration: int = int(self.config.get("max_duration", 600))
         self.cookies_file: str = (self.config.get("cookies_file") or "").strip()
+        self.cookies_refresh_seconds: int = int(self.config.get("cookies_refresh_seconds", 3600))
+        self._cookies_cache_path: Optional[str] = None
+        self._cookies_cache_mtime: float = 0.0
 
         self._rewrite_url = _make_url_rewriter(self.proxy_base)
         self.ytm = self._init_ytmusic()
@@ -213,10 +216,9 @@ class YTMusicPlugin(Star):
             ydl_opts["proxy"] = self.proxy
 
         if self.cookies_file:
-            if os.path.exists(self.cookies_file):
-                ydl_opts["cookiefile"] = self.cookies_file
-            else:
-                logger.warning(f"[ytmusic] cookies_file 不存在: {self.cookies_file}")
+            cookies_path = self._resolve_cookies()
+            if cookies_path:
+                ydl_opts["cookiefile"] = cookies_path
 
         url = f"https://music.youtube.com/watch?v={video_id}"
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -227,6 +229,59 @@ class YTMusicPlugin(Star):
             if os.path.exists(path):
                 return path
         return None
+
+    def _resolve_cookies(self) -> Optional[str]:
+        """把 cookies_file 解析成本地文件路径。支持本地路径或 http(s) URL。
+        URL 形式会缓存到临时目录,按 cookies_refresh_seconds 过期。"""
+        src = self.cookies_file
+        if not src:
+            return None
+
+        # 本地路径
+        if not re.match(r"^https?://", src, re.IGNORECASE):
+            if os.path.exists(src):
+                return src
+            logger.warning(f"[ytmusic] cookies_file 不存在: {src}")
+            return None
+
+        # URL: 检查缓存是否仍有效
+        import time
+
+        cache = self._cookies_cache_path
+        if (
+            cache
+            and os.path.exists(cache)
+            and (time.time() - self._cookies_cache_mtime) < max(self.cookies_refresh_seconds, 0)
+        ):
+            return cache
+
+        try:
+            import requests
+
+            resp = requests.get(src, timeout=15)
+            resp.raise_for_status()
+            content = resp.content
+        except Exception as e:
+            logger.warning(f"[ytmusic] 拉取 cookies URL 失败: {e}")
+            # 拉取失败但之前有缓存,降级用旧的
+            if cache and os.path.exists(cache):
+                return cache
+            return None
+
+        if not cache:
+            fd, cache = tempfile.mkstemp(prefix="ytm_cookies_", suffix=".txt")
+            os.close(fd)
+            self._cookies_cache_path = cache
+        try:
+            with open(cache, "wb") as f:
+                f.write(content)
+            os.chmod(cache, 0o600)
+        except Exception as e:
+            logger.warning(f"[ytmusic] 写入 cookies 缓存失败: {e}")
+            return None
+        self._cookies_cache_mtime = time.time()
+        logger.info(f"[ytmusic] 已从 URL 刷新 cookies 缓存: {cache}")
+        return cache
 
     async def _try_send_qq_music_card(
         self,
