@@ -9,22 +9,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Plain, Record, Image
 
-try:
-    from ytmusicapi import YTMusic
-except ImportError:
-    YTMusic = None
-
-try:
-    import yt_dlp
-except ImportError:
-    yt_dlp = None
-
-
 @register(
     "astrbot_plugin_ytmusic",
-    "AstrBot User",
+    "LuoH-AN",
     "通过 YouTube Music 点歌的插件,使用 `点歌 歌名` 触发",
-    "1.0.0",
+    "1.0.1",
 )
 class YTMusicPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -37,11 +26,10 @@ class YTMusicPlugin(Star):
 
         self.ytm = self._init_ytmusic()
 
-        if yt_dlp is None:
-            logger.warning("[ytmusic] 未安装 yt-dlp,无法下载音频。pip install yt-dlp")
-
     def _init_ytmusic(self):
-        if YTMusic is None:
+        try:
+            from ytmusicapi import YTMusic
+        except ImportError:
             logger.error("[ytmusic] 未安装 ytmusicapi,请执行: pip install ytmusicapi")
             return None
         try:
@@ -66,6 +54,8 @@ class YTMusicPlugin(Star):
             yield event.plain_result("请在「点歌」后输入歌曲名,例如: 点歌 晴天")
             return
 
+        if self.ytm is None:
+            self.ytm = self._init_ytmusic()
         if self.ytm is None:
             yield event.plain_result("未安装 ytmusicapi,无法点歌。请执行 pip install ytmusicapi")
             return
@@ -114,7 +104,7 @@ class YTMusicPlugin(Star):
             )
             return
 
-        if self.send_audio and yt_dlp is not None:
+        if self.send_audio:
             try:
                 audio_path = await asyncio.to_thread(self._download_audio, video_id)
                 if audio_path and os.path.exists(audio_path):
@@ -140,7 +130,10 @@ class YTMusicPlugin(Star):
         return None
 
     def _download_audio(self, video_id: str) -> Optional[str]:
-        if yt_dlp is None:
+        try:
+            import yt_dlp
+        except ImportError:
+            logger.error("[ytmusic] 未安装 yt-dlp,请执行: pip install yt-dlp")
             return None
         tmp_dir = tempfile.gettempdir()
         outtmpl = os.path.join(tmp_dir, f"ytm_{video_id}.%(ext)s")
