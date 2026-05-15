@@ -9,7 +9,8 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import Plain, Record, Image
 
-# 这些主机名(以及它们的子域)会被改写到反代。
+# 这些主机名(以及它们的子域)会被改写到反代,仅用于元信息与封面拉取。
+# 音频文件不再由本插件下载,所以也不会经过反代。
 # 必须与 worker.js 里 PATH_PROXY_HOSTS 的 allowlist 保持一致。
 _PROXY_TARGETS = ("youtube.com", "googlevideo.com", "ytimg.com", "youtu.be")
 
@@ -41,9 +42,7 @@ def _make_url_rewriter(proxy_base: str) -> Callable[[str], Optional[str]]:
             return None
         if not any(host == t or host.endswith("." + t) for t in _PROXY_TARGETS):
             return None
-        # 把原 host 作为 proxy_base 的首段路径
         new_path = base_path + "/" + host + (u.path or "/")
-        # 避免 // 连在一起
         new_path = re.sub(r"/+", "/", new_path)
         return urlunparse((base_scheme, base_netloc, new_path, u.params, u.query, u.fragment))
 
@@ -53,8 +52,8 @@ def _make_url_rewriter(proxy_base: str) -> Callable[[str], Optional[str]]:
 @register(
     "astrbot_plugin_ytmusic",
     "LuoH-AN",
-    "通过 YouTube Music 点歌的插件,使用 `点歌 歌名` 触发",
-    "1.4.0",
+    "通过 YouTube Music 点歌的插件,使用 `点歌 歌名` 触发。音频下载下放到本地 API。",
+    "2.0.0",
 )
 class YTMusicPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -65,10 +64,9 @@ class YTMusicPlugin(Star):
         self.send_card: bool = bool(self.config.get("send_card", True))
         self.send_audio: bool = bool(self.config.get("send_audio", True))
         self.max_duration: int = int(self.config.get("max_duration", 600))
-        self.cookies_file: str = (self.config.get("cookies_file") or "").strip()
-        self.cookies_refresh_seconds: int = int(self.config.get("cookies_refresh_seconds", 3600))
-        self._cookies_cache_path: Optional[str] = None
-        self._cookies_cache_mtime: float = 0.0
+        self.download_api_base: str = (self.config.get("download_api_base") or "").strip().rstrip("/")
+        self.download_api_key: str = (self.config.get("download_api_key") or "").strip()
+        self.download_api_timeout: int = int(self.config.get("download_api_timeout", 300))
 
         self._rewrite_url = _make_url_rewriter(self.proxy_base)
         self.ytm = self._init_ytmusic()
@@ -155,16 +153,26 @@ class YTMusicPlugin(Star):
             )
             return
 
-        if self.send_audio:
-            try:
-                audio_path = await asyncio.to_thread(self._download_audio, video_id)
-                if audio_path and os.path.exists(audio_path):
-                    yield event.chain_result([Record(file=audio_path)])
-                else:
-                    yield event.plain_result("音频文件下载失败,可能是网络/版权问题。")
-            except Exception as e:
-                logger.warning(f"[ytmusic] 下载音频失败: {e}")
-                yield event.plain_result(f"音频下载失败:{e}")
+        if not self.send_audio:
+            return
+
+        if not self.download_api_base:
+            yield event.plain_result(
+                "未配置 download_api_base,无法获取音频。请在插件配置里填入本地下载 API 地址(例如 http://127.0.0.1:3000)。"
+            )
+            return
+
+        try:
+            audio_path = await asyncio.to_thread(self._download_audio_via_api, video_id)
+        except Exception as e:
+            logger.warning(f"[ytmusic] 调用下载 API 失败: {e}")
+            yield event.plain_result(f"音频下载失败:{e}")
+            return
+
+        if audio_path and os.path.exists(audio_path):
+            yield event.chain_result([Record(file=audio_path)])
+        else:
+            yield event.plain_result("音频文件下载失败,可能是网络/版权问题,或下载 API 不可达。")
 
     def _maybe_rewrite(self, url: str) -> str:
         if not self.proxy_base:
@@ -186,119 +194,54 @@ class YTMusicPlugin(Star):
                 return r
         return None
 
-    def _download_audio(self, video_id: str) -> Optional[str]:
-        try:
-            import yt_dlp
-        except ImportError:
-            logger.error("[ytmusic] 未安装 yt-dlp,请执行: pip install yt-dlp")
-            return None
+    def _download_audio_via_api(self, video_id: str) -> Optional[str]:
+        """调用外部下载 API,把返回的音频流写到临时文件并返回路径。"""
+        import requests
+        from urllib.parse import quote
 
-        if self.proxy_base:
-            _install_yt_dlp_patch(self._rewrite_url)
-
-        tmp_dir = tempfile.gettempdir()
-        outtmpl = os.path.join(tmp_dir, f"ytm_{video_id}.%(ext)s")
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": outtmpl,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-        }
-        if not self.proxy_base and self.proxy:
-            ydl_opts["proxy"] = self.proxy
-
-        if self.cookies_file:
-            cookies_path = self._resolve_cookies()
-            if cookies_path:
-                ydl_opts["cookiefile"] = cookies_path
-
-        url = f"https://music.youtube.com/watch?v={video_id}"
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        for ext in ("mp3", "m4a", "webm", "opus", "ogg"):
-            path = os.path.join(tmp_dir, f"ytm_{video_id}.{ext}")
-            if os.path.exists(path):
-                return path
-        return None
-
-    def _resolve_cookies(self) -> Optional[str]:
-        """把 cookies_file 解析成本地文件路径。支持本地路径或 http(s) URL。
-        URL 形式会缓存到临时目录,按 cookies_refresh_seconds 过期。"""
-        src = self.cookies_file
-        if not src:
-            return None
-
-        # 本地路径
-        if not re.match(r"^https?://", src, re.IGNORECASE):
-            if os.path.exists(src):
-                return src
-            logger.warning(f"[ytmusic] cookies_file 不存在: {src}")
-            return None
-
-        # URL: 检查缓存是否仍有效
-        import time
-
-        cache = self._cookies_cache_path
-        if (
-            cache
-            and os.path.exists(cache)
-            and (time.time() - self._cookies_cache_mtime) < max(self.cookies_refresh_seconds, 0)
-        ):
-            return cache
+        api_url = f"{self.download_api_base}/download/{quote(video_id, safe='')}"
+        headers = {}
+        if self.download_api_key:
+            headers["X-API-Key"] = self.download_api_key
 
         try:
-            import requests
-
             resp = requests.get(
-                src,
-                timeout=20,
-                allow_redirects=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-                    "Accept": "text/plain, */*;q=0.5",
-                },
+                api_url,
+                headers=headers,
+                timeout=self.download_api_timeout,
+                stream=True,
             )
-            resp.raise_for_status()
-            content = resp.content
         except Exception as e:
-            # 截断最终 URL,避免签名链刷屏
-            final_url = ""
+            logger.warning(f"[ytmusic] 连接下载 API 失败: {api_url} -> {e}")
+            return None
+
+        if resp.status_code != 200:
+            body = ""
             try:
-                final_url = getattr(e, "response", None).url if getattr(e, "response", None) else ""
+                body = resp.text[:200]
             except Exception:
                 pass
-            if final_url and len(final_url) > 200:
-                final_url = final_url[:200] + "...(truncated)"
-            logger.warning(f"[ytmusic] 拉取 cookies URL 失败: {type(e).__name__}: {e.__class__.__name__} src={src} final={final_url}")
-            # 拉取失败但之前有缓存,降级用旧的
-            if cache and os.path.exists(cache):
-                return cache
+            logger.warning(f"[ytmusic] 下载 API 返回 {resp.status_code}: {body}")
             return None
 
-        if not cache:
-            fd, cache = tempfile.mkstemp(prefix="ytm_cookies_", suffix=".txt")
-            os.close(fd)
-            self._cookies_cache_path = cache
+        ext = "mp3"
+        cd = resp.headers.get("content-disposition", "")
+        m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.IGNORECASE)
+        if m:
+            ext_match = re.search(r"\.([a-zA-Z0-9]+)$", m.group(1))
+            if ext_match:
+                ext = ext_match.group(1).lower()
+
+        out_path = os.path.join(tempfile.gettempdir(), f"ytm_{video_id}.{ext}")
         try:
-            with open(cache, "wb") as f:
-                f.write(content)
-            os.chmod(cache, 0o600)
+            with open(out_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        f.write(chunk)
         except Exception as e:
-            logger.warning(f"[ytmusic] 写入 cookies 缓存失败: {e}")
+            logger.warning(f"[ytmusic] 写入下载文件失败: {e}")
             return None
-        self._cookies_cache_mtime = time.time()
-        logger.info(f"[ytmusic] 已从 URL 刷新 cookies 缓存: {cache}")
-        return cache
+        return out_path
 
     async def _try_send_qq_music_card(
         self,
@@ -390,58 +333,3 @@ def _patch_requests_session(session, rewriter: Callable[[str], Optional[str]], p
         return original_send(request, **kwargs)
 
     session.send = send
-
-
-def _install_yt_dlp_patch(rewriter: Callable[[str], Optional[str]]) -> None:
-    """对 yt_dlp 的 RequestDirector.send 打补丁,把出站 URL 全部走反代。幂等。"""
-    try:
-        from yt_dlp.networking.common import RequestDirector
-    except Exception as e:
-        logger.warning(f"[ytmusic] 无法 patch yt_dlp(可能版本过旧): {e}")
-        return
-
-    if getattr(RequestDirector.send, "_ytm_proxy_patched", False):
-        RequestDirector._ytm_rewriter = rewriter
-        return
-
-    original_send = RequestDirector.send
-    RequestDirector._ytm_rewriter = rewriter
-
-    def patched_send(self, request):
-        rw = getattr(RequestDirector, "_ytm_rewriter", None)
-        if rw is not None:
-            new_url = rw(request.url)
-            if new_url:
-                # 必须在改 URL *之前* 把 cookies 算好塞进 Cookie 头。
-                # 否则 urllib 的 HTTPCookieProcessor 会按改写后的 URL(ytproxy.luoh.org)
-                # 找匹配 cookies,而 cookies.txt 里的 cookie domain 都是 .youtube.com,
-                # 匹配失败 -> 请求变成匿名 -> YT 反爬。
-                #
-                # cookiejar 来源:
-                # 1. request.extensions["cookiejar"] — per-request override
-                # 2. handler.cookiejar — 全局 cookiejar (从 cookiefile 加载)
-                # 复刻 yt_dlp/networking/common.py: RequestHandler._get_cookiejar 的逻辑
-                try:
-                    import urllib.request as _ur
-
-                    cookiejar = request.extensions.get("cookiejar") if request.extensions else None
-                    if cookiejar is None:
-                        # 从 handlers 里找 Urllib handler,拿它的 cookiejar
-                        for h in getattr(self, "handlers", {}).values():
-                            if getattr(h, "RH_NAME", "") == "Urllib":
-                                cookiejar = getattr(h, "cookiejar", None)
-                                break
-                    if cookiejar is not None:
-                        fake = _ur.Request(request.url)
-                        cookiejar.add_cookie_header(fake)
-                        cookie_hdr = fake.get_header("Cookie")
-                        if cookie_hdr:
-                            request.headers["Cookie"] = cookie_hdr
-                except Exception as e:
-                    logger.debug(f"[ytmusic] 预注入 cookies 失败: {e}")
-                request.url = new_url
-        return original_send(self, request)
-
-    patched_send._ytm_proxy_patched = True
-    RequestDirector.send = patched_send
-    logger.info("[ytmusic] 已为 yt_dlp 安装反代 URL 重写补丁")
