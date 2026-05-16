@@ -21,6 +21,7 @@
 import logging
 import os
 import re
+import shutil
 import tempfile
 from typing import Optional
 
@@ -54,11 +55,8 @@ def _check_auth(x_api_key: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="invalid api key")
 
 
-def _cleanup(path: str) -> None:
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+def _cleanup_dir(path: str) -> None:
+    shutil.rmtree(path, ignore_errors=True)
 
 
 @app.get("/health")
@@ -80,8 +78,9 @@ def download(
     if not VIDEO_ID_RE.match(video_id):
         raise HTTPException(status_code=400, detail="bad video_id")
 
-    tmp_dir = tempfile.gettempdir()
-    out_template = os.path.join(tmp_dir, f"ytm_{video_id}.%(ext)s")
+    # 每个请求一个独立工作目录,避免同 videoId 并发时 yt-dlp 抢同一个 .part 文件
+    work_dir = tempfile.mkdtemp(prefix=f"ytm_{video_id}_")
+    out_template = os.path.join(work_dir, f"{video_id}.%(ext)s")
 
     ydl_opts = {
         "format": "bestaudio/best",
@@ -104,25 +103,27 @@ def download(
             log.warning(f"YTM_COOKIES_FILE 不存在: {COOKIES_FILE}")
 
     url = f"https://music.youtube.com/watch?v={video_id}"
-    log.info(f"download start: {video_id}")
+    log.info(f"download start: {video_id} -> {work_dir}")
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
     except Exception as e:
+        _cleanup_dir(work_dir)
         log.exception("download failed")
         raise HTTPException(status_code=502, detail=f"download failed: {e}")
 
     for ext in ("mp3", "m4a", "webm", "opus", "ogg"):
-        candidate = os.path.join(tmp_dir, f"ytm_{video_id}.{ext}")
+        candidate = os.path.join(work_dir, f"{video_id}.{ext}")
         if os.path.exists(candidate):
             log.info(f"download done: {video_id} -> {candidate}")
-            background.add_task(_cleanup, candidate)
+            background.add_task(_cleanup_dir, work_dir)
             return FileResponse(
                 candidate,
                 media_type=EXT_MEDIA_TYPES.get(ext, "application/octet-stream"),
                 filename=f"{video_id}.{ext}",
             )
 
+    _cleanup_dir(work_dir)
     raise HTTPException(status_code=500, detail="audio file missing after yt-dlp run")
 
 
