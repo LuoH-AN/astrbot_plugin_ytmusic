@@ -16,6 +16,7 @@ https://music.luoh.org
 - 可选发送 QQ 自定义音乐卡片(仅 aiocqhttp)
 - 可选把音频下载到临时文件后用 `Record` 发送
 - 发送语音前会检测 `ffmpeg`,缺失时自动安装 `imageio-ffmpeg` 并把内置 ffmpeg 加入运行时 `PATH`
+- 发送语音前会把音频压成 24kHz/单声道/64k MP3,避免 FLAC 大文件导致 QQ `sendMsg` 超时
 
 ## 安装
 
@@ -50,6 +51,7 @@ reload 插件。
 - 播放链接可能会过期,插件会在每次点歌时重新获取。
 - 如果返回 `url: null`,通常是网易限制、Cookie 缺失或接口部署侧问题。
 - 如果系统没有 `ffmpeg`,插件会在第一次发送语音时尝试自动准备。自动安装需要当前 Python 环境能执行 `pip install imageio-ffmpeg`。
+- 为减少 aiocqhttp/NapCat 偶发 `sendMsg` 超时,插件会限制源音频下载大小,并在发送前压缩语音文件；压缩后仍过大时会跳过语音发送并返回播放链接。
 
 ## 许可证
 

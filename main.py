@@ -22,6 +22,10 @@ NETEASE_RANDOM_CN_IP = "true"
 API_TIMEOUT = 20
 DOWNLOAD_TIMEOUT = 180
 FFMPEG_BOOTSTRAP_TIMEOUT = 300
+MAX_AUDIO_DOWNLOAD_BYTES = 80 * 1024 * 1024
+MAX_VOICE_BYTES = 15 * 1024 * 1024
+VOICE_SAMPLE_RATE = 24000
+VOICE_BITRATE = "64k"
 
 
 @register(
@@ -140,6 +144,18 @@ class NetEaseMusicPlugin(Star):
                     f"音频已下载,但自动准备 ffmpeg 失败:{e}\n播放链接:{audio_url}"
                 )
                 return
+            try:
+                audio_path = await asyncio.to_thread(
+                    self._prepare_voice_file,
+                    audio_path,
+                    song_id,
+                )
+            except Exception as e:
+                logger.warning(f"[ncmusic] 语音压缩失败:{e}")
+                yield event.plain_result(
+                    f"音频已下载,但语音压缩失败:{e}\n播放链接:{audio_url}"
+                )
+                return
             yield event.chain_result([Record(file=audio_path)])
         else:
             yield event.plain_result(f"音频文件下载失败。播放链接:{audio_url}")
@@ -248,6 +264,14 @@ class NetEaseMusicPlugin(Star):
                     pass
                 raise RuntimeError(f"音频源返回 {resp.status_code}:{body}")
 
+            content_length = resp.headers.get("content-length")
+            if content_length and content_length.isdigit():
+                size = int(content_length)
+                if size > MAX_AUDIO_DOWNLOAD_BYTES:
+                    raise RuntimeError(
+                        f"音频源文件过大({self._fmt_bytes(size)}),跳过语音发送"
+                    )
+
             ext = self._guess_audio_ext(
                 audio_url,
                 resp.headers.get("content-type", ""),
@@ -260,9 +284,15 @@ class NetEaseMusicPlugin(Star):
                 prefix=f"ncm_{song_id}_",
             )
             try:
+                written = 0
                 with tmp:
                     for chunk in resp.iter_content(chunk_size=64 * 1024):
                         if chunk:
+                            written += len(chunk)
+                            if written > MAX_AUDIO_DOWNLOAD_BYTES:
+                                raise RuntimeError(
+                                    f"音频源文件超过 {self._fmt_bytes(MAX_AUDIO_DOWNLOAD_BYTES)},跳过语音发送"
+                                )
                             tmp.write(chunk)
             except Exception:
                 try:
@@ -271,6 +301,56 @@ class NetEaseMusicPlugin(Star):
                     pass
                 raise
             return tmp.name
+
+    def _prepare_voice_file(self, source_path: str, song_id: str) -> str:
+        ffmpeg = self._ensure_ffmpeg()
+        out_file = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".mp3",
+            prefix=f"ncm_voice_{song_id}_",
+        )
+        out_path = out_file.name
+        out_file.close()
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            source_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(VOICE_SAMPLE_RATE),
+            "-b:a",
+            VOICE_BITRATE,
+            out_path,
+        ]
+        try:
+            subprocess.run(cmd, check=True, timeout=DOWNLOAD_TIMEOUT)
+        except Exception:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            raise
+
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("ffmpeg 未生成语音文件")
+
+        size = os.path.getsize(out_path)
+        if size > MAX_VOICE_BYTES:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"压缩后语音仍过大({self._fmt_bytes(size)}),跳过发送"
+            )
+        return out_path
 
     def _has_ffmpeg(self) -> bool:
         return bool(shutil.which("ffmpeg"))
@@ -352,6 +432,14 @@ class NetEaseMusicPlugin(Star):
     def _join_artists(artists: list[dict[str, Any]]) -> str:
         names = [item.get("name", "") for item in artists if item.get("name")]
         return ", ".join(names) if names else "未知"
+
+    @staticmethod
+    def _fmt_bytes(size: int) -> str:
+        if size >= 1024 * 1024:
+            return f"{size / 1024 / 1024:.1f}MB"
+        if size >= 1024:
+            return f"{size / 1024:.1f}KB"
+        return f"{size}B"
 
     @staticmethod
     def _guess_audio_ext(
