@@ -1,7 +1,12 @@
 import asyncio
 import os
 import re
+import shutil
+import stat
+import subprocess
+import sys
 import tempfile
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -16,6 +21,7 @@ NETEASE_LEVEL = "exhigh"
 NETEASE_RANDOM_CN_IP = "true"
 API_TIMEOUT = 20
 DOWNLOAD_TIMEOUT = 180
+FFMPEG_BOOTSTRAP_TIMEOUT = 300
 
 
 @register(
@@ -32,6 +38,7 @@ class NetEaseMusicPlugin(Star):
         self.send_card: bool = bool(self.config.get("send_card", True))
         self.send_audio: bool = bool(self.config.get("send_audio", True))
         self.max_duration: int = int(self.config.get("max_duration", 600))
+        self._ffmpeg_ready = False
 
     @filter.command("点歌")
     async def order_song(self, event: AstrMessageEvent, song_name: str = ""):
@@ -123,6 +130,16 @@ class NetEaseMusicPlugin(Star):
             return
 
         if audio_path and os.path.exists(audio_path):
+            if not self._has_ffmpeg():
+                yield event.plain_result("检测到 ffmpeg 未安装,正在自动准备语音处理组件...")
+            try:
+                await asyncio.to_thread(self._ensure_ffmpeg)
+            except Exception as e:
+                logger.warning(f"[ncmusic] 自动准备 ffmpeg 失败:{e}")
+                yield event.plain_result(
+                    f"音频已下载,但自动准备 ffmpeg 失败:{e}\n播放链接:{audio_url}"
+                )
+                return
             yield event.chain_result([Record(file=audio_path)])
         else:
             yield event.plain_result(f"音频文件下载失败。播放链接:{audio_url}")
@@ -254,6 +271,82 @@ class NetEaseMusicPlugin(Star):
                     pass
                 raise
             return tmp.name
+
+    def _has_ffmpeg(self) -> bool:
+        return bool(shutil.which("ffmpeg"))
+
+    def _ensure_ffmpeg(self) -> str:
+        if self._ffmpeg_ready:
+            ffmpeg_path = shutil.which("ffmpeg")
+            if ffmpeg_path:
+                return ffmpeg_path
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path:
+            self._ffmpeg_ready = True
+            return ffmpeg_path
+
+        exe = self._get_imageio_ffmpeg_exe()
+        shim_path = self._install_ffmpeg_shim(exe)
+        shim_dir = str(shim_path.parent)
+        path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        if shim_dir not in path_parts:
+            os.environ["PATH"] = shim_dir + os.pathsep + os.environ.get("PATH", "")
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            raise RuntimeError("ffmpeg 已下载但未能加入 PATH")
+
+        self._ffmpeg_ready = True
+        logger.info(f"[ncmusic] ffmpeg ready: {ffmpeg_path}")
+        return ffmpeg_path
+
+    def _get_imageio_ffmpeg_exe(self) -> str:
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            logger.info("[ncmusic] 未找到 imageio-ffmpeg,尝试自动安装")
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "imageio-ffmpeg>=0.5.1",
+                ],
+                check=True,
+                timeout=FFMPEG_BOOTSTRAP_TIMEOUT,
+            )
+            import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if not exe or not os.path.exists(exe):
+            raise RuntimeError("imageio-ffmpeg 未返回可用的 ffmpeg")
+        return exe
+
+    def _install_ffmpeg_shim(self, source: str) -> Path:
+        shim_dir = Path(tempfile.gettempdir()) / "astrbot_plugin_ytmusic_ffmpeg"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        shim_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        shim_path = shim_dir / shim_name
+
+        if shim_path.exists():
+            try:
+                if shim_path.resolve() == Path(source).resolve():
+                    return shim_path
+            except OSError:
+                pass
+            shim_path.unlink()
+
+        try:
+            shim_path.symlink_to(source)
+        except OSError:
+            shutil.copy2(source, shim_path)
+
+        if os.name != "nt":
+            mode = shim_path.stat().st_mode
+            shim_path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return shim_path
 
     @staticmethod
     def _join_artists(artists: list[dict[str, Any]]) -> str:
