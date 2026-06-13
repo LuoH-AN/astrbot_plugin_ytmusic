@@ -26,6 +26,7 @@ MAX_AUDIO_DOWNLOAD_BYTES = 80 * 1024 * 1024
 MAX_VOICE_BYTES = 15 * 1024 * 1024
 VOICE_SAMPLE_RATE = 24000
 VOICE_BITRATE = "64k"
+ORDER_SONG_PATTERN = r"^(?:@\S+\s+|\S+\s+)?/?点歌(?:\s+.*)?$"
 
 
 @register(
@@ -44,12 +45,9 @@ class NetEaseMusicPlugin(Star):
         self.max_duration: int = int(self.config.get("max_duration", 600))
         self._ffmpeg_ready = False
 
-    @filter.command("点歌")
-    async def order_song(self, event: AstrMessageEvent, song_name: str = ""):
-        keyword = (song_name or "").strip()
-        if not keyword:
-            msg_str = (event.message_str or "").strip()
-            keyword = re.sub(r"^/?点歌\s*", "", msg_str).strip()
+    @filter.regex(ORDER_SONG_PATTERN)
+    async def order_song(self, event: AstrMessageEvent):
+        keyword = self._extract_order_keyword(event)
 
         if not keyword:
             yield event.plain_result("请在「点歌」后输入歌曲名,例如: 点歌 晴天")
@@ -159,6 +157,17 @@ class NetEaseMusicPlugin(Star):
             yield event.chain_result([Record(file=audio_path)])
         else:
             yield event.plain_result(f"音频文件下载失败。播放链接:{audio_url}")
+
+    def _extract_order_keyword(self, event: AstrMessageEvent) -> str:
+        msg = (event.message_str or "").strip()
+        msg = re.sub(r"^\[At:[^\]]+\]\s*", "", msg)
+        msg = re.sub(r"^\[CQ:at,[^\]]+\]\s*", "", msg)
+        msg = re.sub(r"^@\S+\s+", "", msg)
+
+        match = re.search(r"(?:^|\s)/?点歌(?:\s+|$)(.*)$", msg)
+        if not match:
+            return ""
+        return match.group(1).strip()
 
     def _api_get(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
         import requests

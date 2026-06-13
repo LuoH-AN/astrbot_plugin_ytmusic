@@ -1,6 +1,6 @@
 # astrbot_plugin_ytmusic 网易云版
 
-通过网易云音乐点歌的 AstrBot 插件。在群里发 `点歌 晴天` 即可触发：返回歌曲信息、封面、网易云链接，可选发送 QQ 音乐自定义卡片，可选下载音频后以语音消息发送。
+通过网易云音乐点歌的 AstrBot 插件。在群里发 `点歌 晴天` 或 `@人机 点歌 晴天` 即可触发：返回歌曲信息、封面、网易云链接，可选发送 QQ 音乐自定义卡片，可选下载音频后以语音消息发送。
 
 当前版本已改为使用硬编码 API：
 
@@ -10,7 +10,7 @@ https://music.luoh.org
 
 ## 功能
 
-- `点歌 <歌名>` 调用 `https://music.luoh.org/search` 搜索网易云歌曲
+- `点歌 <歌名>` / `@人机 点歌 <歌名>` 调用 `https://music.luoh.org/search` 搜索网易云歌曲
 - 调用 `https://music.luoh.org/song/detail` 补全封面、专辑、歌手信息
 - 调用 `https://music.luoh.org/song/url/v1` 获取播放链接,拿不到时自动用 `unblock=true` 重试
 - 可选发送 QQ 自定义音乐卡片(仅 aiocqhttp)
