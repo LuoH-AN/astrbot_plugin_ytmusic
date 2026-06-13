@@ -1,36 +1,11 @@
 {
-  "proxy_base": {
-    "description": "反向代理基址(路径式,默认 https://ytproxy.luoh.org),仅用于元信息/封面拉取。所有发往 youtube.com / googlevideo.com / ytimg.com / youtu.be 的请求会改写成 <proxy_base>/<原域名>/<原路径>,由 Worker 反代。设为空则禁用反代。",
-    "type": "string",
-    "default": "https://ytproxy.luoh.org"
-  },
-  "proxy": {
-    "description": "兜底 HTTP/SOCKS 代理(可选),例如 http://127.0.0.1:7890。仅在 proxy_base 为空时生效。只影响元信息拉取,不影响音频下载 API。",
-    "type": "string",
-    "default": ""
-  },
-  "download_api_base": {
-    "description": "本地音频下载 API 的基址(必填,否则无法发送语音),例如 http://127.0.0.1:3000 或 https://your-tunnel.example.com。配套服务端代码见仓库下的 download_api/。",
-    "type": "string",
-    "default": ""
-  },
-  "download_api_key": {
-    "description": "下载 API 的鉴权密钥(可选,需与 API 端 YTM_API_KEY 环境变量一致)。设了之后请求会带 X-API-Key 头。",
-    "type": "string",
-    "default": ""
-  },
-  "download_api_timeout": {
-    "description": "调用下载 API 的总超时秒数,默认 300。包含 yt-dlp 下载 + 转码 + 回传时间。",
-    "type": "int",
-    "default": 300
-  },
   "send_card": {
     "description": "是否尝试发送 QQ 音乐卡片(仅 aiocqhttp 平台,部分协议端不支持)",
     "type": "bool",
     "default": true
   },
   "send_audio": {
-    "description": "是否调用下载 API 拉音频并发送语音消息",
+    "description": "是否下载网易云播放链接并作为语音消息发送",
     "type": "bool",
     "default": true
   },
