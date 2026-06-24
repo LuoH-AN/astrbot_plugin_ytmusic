@@ -263,7 +263,10 @@ class QQMusicPlugin(Star):
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            )
+            ),
+            "Referer": "https://y.qq.com/",
+            "Accept": "*/*",
+            "Range": "bytes=0-",
         }
         with requests.get(
             audio_url,
@@ -271,7 +274,7 @@ class QQMusicPlugin(Star):
             timeout=(10, DOWNLOAD_TIMEOUT),
             stream=True,
         ) as resp:
-            if resp.status_code != 200:
+            if resp.status_code not in (200, 206):
                 body = ""
                 try:
                     body = resp.text[:200]
@@ -315,6 +318,12 @@ class QQMusicPlugin(Star):
                 except OSError:
                     pass
                 raise
+            if written == 0:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+                raise RuntimeError("音频源返回 0 字节,播放链接可能已失效或被风控")
             return tmp.name
 
     def _prepare_voice_file(self, source_path: str, song_mid: str) -> str:
