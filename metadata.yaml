@@ -1,5 +1,5 @@
 name: astrbot_plugin_ytmusic
-desc: 通过网易云音乐点歌的 AstrBot 插件,使用硬编码 API https://music.luoh.org
-version: 3.0.0
+desc: 通过 QQ 音乐点歌的 AstrBot 插件,基于 qqmusic_api,使用「点歌 歌名」触发
+version: 4.0.0
 author: LuoH-AN
 repo: https://github.com/LuoH-AN/astrbot_plugin_ytmusic

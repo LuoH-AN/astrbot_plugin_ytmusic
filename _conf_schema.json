@@ -1,11 +1,21 @@
 {
+  "musicid": {
+    "description": "QQ 音乐 MusicID (凭据, 用于下载有版权歌曲; 留空则匿名搜索但多数歌曲无法下载音频)",
+    "type": "string",
+    "default": ""
+  },
+  "musickey": {
+    "description": "QQ 音乐 MusicKey (凭据, 与 MusicID 配对; 通过登录获取, 勿公开泄露)",
+    "type": "string",
+    "default": ""
+  },
   "send_card": {
     "description": "是否尝试发送 QQ 音乐卡片(仅 aiocqhttp 平台,部分协议端不支持)",
     "type": "bool",
     "default": true
   },
   "send_audio": {
-    "description": "是否下载网易云播放链接并作为语音消息发送",
+    "description": "是否下载 QQ 音乐播放链接并作为语音消息发送",
     "type": "bool",
     "default": true
   },

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import re
 import shutil
 import stat
@@ -15,10 +16,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain, Record
 from astrbot.api.star import Context, Star, register
 
+from qqmusic_api import Client, Credential
+from qqmusic_api.modules.search import SearchType
+from qqmusic_api.modules.song import SongFileInfo, SongFileType
 
-NETEASE_API_BASE = "https://music.luoh.org"
-NETEASE_LEVEL = "exhigh"
-NETEASE_RANDOM_CN_IP = "true"
+
 API_TIMEOUT = 20
 DOWNLOAD_TIMEOUT = 180
 FFMPEG_BOOTSTRAP_TIMEOUT = 300
@@ -28,22 +30,43 @@ VOICE_SAMPLE_RATE = 24000
 VOICE_BITRATE = "64k"
 ORDER_SONG_PATTERN = r"^(?:@\S+\s+|\S+\s+)?/?点歌(?:\s+.*)?$"
 
+# 音质逐级降级列表, 从高品质向低品质尝试, 取第一个有可用链接的音质.
+SONG_FILE_TYPES: list[SongFileType] = [
+    SongFileType.MP3_320,
+    SongFileType.MP3_128,
+    SongFileType.OGG_96,
+]
+
 
 @register(
     "astrbot_plugin_ytmusic",
     "LuoH-AN",
-    "通过硬编码的网易云 API 点歌的插件,使用 `点歌 歌名` 触发。",
-    "3.0.0",
+    "通过 QQ 音乐点歌的插件,使用 `点歌 歌名` 触发。",
+    "4.0.0",
 )
-class NetEaseMusicPlugin(Star):
+class QQMusicPlugin(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config or {}
-        self.api_base = NETEASE_API_BASE.rstrip("/")
         self.send_card: bool = bool(self.config.get("send_card", True))
         self.send_audio: bool = bool(self.config.get("send_audio", True))
         self.max_duration: int = int(self.config.get("max_duration", 600))
+        self.musicid: str = str(self.config.get("musicid", "")).strip()
+        self.musickey: str = str(self.config.get("musickey", "")).strip()
         self._ffmpeg_ready = False
+
+    @property
+    def has_credential(self) -> bool:
+        """是否配置了可用的 QQ 音乐凭据."""
+        return bool(self.musicid and self.musickey)
+
+    def _build_credential(self) -> Credential:
+        """根据配置项构造 QQ 音乐凭据."""
+        return Credential(
+            musicid=int(self.musicid) if self.musicid.isdigit() else 0,
+            str_musicid=self.musicid,
+            musickey=self.musickey,
+        )
 
     @filter.regex(ORDER_SONG_PATTERN)
     async def order_song(self, event: AstrMessageEvent):
@@ -56,9 +79,9 @@ class NetEaseMusicPlugin(Star):
         yield event.plain_result(f"正在为你搜索:{keyword} ...")
 
         try:
-            track = await asyncio.to_thread(self._search_song, keyword)
+            track = await self._search_song(keyword)
         except Exception as e:
-            logger.exception("[ncmusic] 搜索失败")
+            logger.exception("[qqmusic] 搜索失败")
             yield event.plain_result(f"搜索失败:{e}")
             return
 
@@ -66,13 +89,14 @@ class NetEaseMusicPlugin(Star):
             yield event.plain_result(f"未找到与「{keyword}」相关的歌曲。")
             return
 
-        song_id = str(track["id"])
+        song_id = track["id"]
+        song_mid = track["mid"]
         title = track.get("title") or "Unknown"
         artists = track.get("artists") or "未知"
         album = track.get("album") or "未知"
         duration = int(track.get("duration_seconds") or 0)
         thumbnail = track.get("thumbnail") or ""
-        play_url = f"https://music.163.com/#/song?id={song_id}"
+        play_url = f"https://y.qq.com/n/ryqq/songDetail/{song_mid}"
 
         info_text = (
             f"找到歌曲:\n"
@@ -91,15 +115,15 @@ class NetEaseMusicPlugin(Star):
 
         audio_info: dict[str, Any] = {}
         try:
-            audio_info = await asyncio.to_thread(self._get_audio_url, song_id)
+            audio_info = await self._get_audio_url(song_mid)
         except Exception as e:
-            logger.warning(f"[ncmusic] 获取播放链接失败:{e}")
+            logger.warning(f"[qqmusic] 获取播放链接失败:{e}")
 
         audio_url = audio_info.get("url") or ""
         if self.send_card:
             await self._try_send_qq_music_card(
                 event,
-                song_id,
+                song_mid,
                 title,
                 artists,
                 thumbnail,
@@ -116,18 +140,18 @@ class NetEaseMusicPlugin(Star):
             return
 
         if not audio_url:
-            yield event.plain_result("未拿到可播放音频链接,可能需要登录 Cookie 或接口被网易限制。")
+            yield event.plain_result("未拿到可播放音频链接,可能需要登录 QQ 音乐会员或歌曲无版权。")
             return
 
         try:
             audio_path = await asyncio.to_thread(
                 self._download_audio,
-                song_id,
+                song_mid,
                 audio_url,
-                audio_info.get("type") or audio_info.get("encodeType"),
+                audio_info.get("ext", ""),
             )
         except Exception as e:
-            logger.warning(f"[ncmusic] 音频下载失败:{e}")
+            logger.warning(f"[qqmusic] 音频下载失败:{e}")
             yield event.plain_result(f"音频下载失败:{e}\n播放链接:{audio_url}")
             return
 
@@ -137,7 +161,7 @@ class NetEaseMusicPlugin(Star):
             try:
                 await asyncio.to_thread(self._ensure_ffmpeg)
             except Exception as e:
-                logger.warning(f"[ncmusic] 自动准备 ffmpeg 失败:{e}")
+                logger.warning(f"[qqmusic] 自动准备 ffmpeg 失败:{e}")
                 yield event.plain_result(
                     f"音频已下载,但自动准备 ffmpeg 失败:{e}\n播放链接:{audio_url}"
                 )
@@ -146,10 +170,10 @@ class NetEaseMusicPlugin(Star):
                 audio_path = await asyncio.to_thread(
                     self._prepare_voice_file,
                     audio_path,
-                    song_id,
+                    song_mid,
                 )
             except Exception as e:
-                logger.warning(f"[ncmusic] 语音压缩失败:{e}")
+                logger.warning(f"[qqmusic] 语音压缩失败:{e}")
                 yield event.plain_result(
                     f"音频已下载,但语音压缩失败:{e}\n播放链接:{audio_url}"
                 )
@@ -169,88 +193,70 @@ class NetEaseMusicPlugin(Star):
             return ""
         return match.group(1).strip()
 
-    def _api_get(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
-        import requests
+    async def _search_song(self, keyword: str) -> Optional[dict[str, Any]]:
+        """通过 QQ 音乐搜索歌曲, 返回首条结果的归一化信息."""
+        async with Client(self._build_credential_safe()) as client:
+            result = await client.search.search_by_type(keyword, search_type=SearchType.SONG, num=10)
+            songs = result.song or []
+            if not songs:
+                return None
+            return self._normalize_song(songs[0])
 
-        url = f"{self.api_base}/{endpoint.lstrip('/')}"
-        query = {"randomCNIP": NETEASE_RANDOM_CN_IP, **params}
-        resp = requests.get(url, params=query, timeout=API_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        if not isinstance(data, dict):
-            raise RuntimeError("API 返回格式不是 JSON object")
-        return data
+    def _build_credential_safe(self) -> Optional[Credential]:
+        """配置了凭据则返回凭据, 否则返回 None 使用匿名访问."""
+        return self._build_credential() if self.has_credential else None
 
-    def _search_song(self, keyword: str) -> Optional[dict[str, Any]]:
-        data = self._api_get("search", {"keywords": keyword, "limit": 10})
-        songs = (data.get("result") or {}).get("songs") or []
-        song = next((item for item in songs if item.get("id")), None)
-        if not song:
-            return None
-
-        track = self._normalize_song(song)
+    def _normalize_song(self, song: Any) -> dict[str, Any]:
+        """将 QQ 音乐 Song 模型归一化为插件内部使用的字典."""
         try:
-            detail = self._song_detail(str(track["id"]))
-        except Exception as e:
-            logger.debug(f"[ncmusic] 获取歌曲详情失败:{e}")
-            detail = {}
-
-        return {**track, **{k: v for k, v in detail.items() if v}}
-
-    def _song_detail(self, song_id: str) -> dict[str, Any]:
-        data = self._api_get("song/detail", {"ids": song_id})
-        songs = data.get("songs") or []
-        if not songs:
-            return {}
-        return self._normalize_song(songs[0])
-
-    def _normalize_song(self, song: dict[str, Any]) -> dict[str, Any]:
-        album = song.get("album") or song.get("al") or {}
-        artists = song.get("artists") or song.get("ar") or []
-        duration_ms = song.get("duration") or song.get("dt") or 0
-        try:
-            duration_seconds = int(duration_ms) // 1000
-        except (TypeError, ValueError):
-            duration_seconds = 0
-
+            thumbnail = song.cover_url() or ""
+        except Exception:
+            thumbnail = ""
+        artists = ", ".join(singer.name for singer in song.singer if singer.name) if song.singer else "未知"
         return {
-            "id": song.get("id"),
-            "title": song.get("name") or "Unknown",
-            "artists": self._join_artists(artists),
-            "album": album.get("name") or "未知",
-            "duration_seconds": duration_seconds,
-            "thumbnail": album.get("picUrl") or album.get("blurPicUrl") or "",
+            "id": str(song.id),
+            "mid": song.mid,
+            "title": song.name or "Unknown",
+            "artists": artists or "未知",
+            "album": getattr(song.album, "name", "") or "未知",
+            "duration_seconds": int(song.interval or 0),
+            "thumbnail": thumbnail,
         }
 
-    def _get_audio_url(self, song_id: str) -> dict[str, Any]:
-        for use_unblock in (False, True):
-            params = {
-                "id": song_id,
-                "level": NETEASE_LEVEL,
-            }
-            if use_unblock:
-                params["unblock"] = "true"
+    async def _get_audio_url(self, song_mid: str) -> dict[str, Any]:
+        """逐级降级音质获取首个可用播放链接.
 
-            data = self._api_get("song/url/v1", params)
-            items = data.get("data") or []
-            if items and isinstance(items[0], dict):
-                item = items[0]
-                url = item.get("url") or item.get("proxyUrl") or ""
-                if url:
-                    return {
-                        "url": url,
-                        "type": item.get("type") or item.get("encodeType") or "",
-                        "level": item.get("level") or NETEASE_LEVEL,
-                        "source": "song/url/v1:unblock" if use_unblock else "song/url/v1",
-                    }
+        Args:
+            song_mid: 歌曲 Media MID.
 
-        fallback = self._api_get("song/url/match", {"id": song_id})
-        url = fallback.get("data") or fallback.get("proxyUrl") or ""
-        if isinstance(url, str) and url:
-            return {"url": url, "type": "", "level": "match"}
+        Returns:
+            包含 url 与 ext 的字典; 无可用链接时返回空字典.
+        """
+        credential = self._build_credential_safe()
+        async with Client(credential) as client:
+            cdn_dispatch = await client.song.get_cdn_dispatch()
+            cdn_list = cdn_dispatch.sip or []
+            if not cdn_list:
+                return {}
+
+            cdn = random.choice(cdn_list)
+            for file_type in SONG_FILE_TYPES:
+                urls = await client.song.get_song_urls(
+                    [SongFileInfo(mid=song_mid, file_type=file_type)],
+                    file_type=file_type,
+                )
+                for info in urls.data or []:
+                    if info.purl:
+                        return {
+                            "url": cdn + info.purl,
+                            "ext": file_type.e.lstrip("."),
+                            "type": file_type.e.lstrip("."),
+                            "level": file_type.name,
+                            "source": f"qqmusic:{file_type.name}",
+                        }
         return {}
 
-    def _download_audio(self, song_id: str, audio_url: str, ext_hint: str = "") -> str:
+    def _download_audio(self, song_mid: str, audio_url: str, ext_hint: str = "") -> str:
         import requests
 
         headers = {
@@ -290,7 +296,7 @@ class NetEaseMusicPlugin(Star):
             tmp = tempfile.NamedTemporaryFile(
                 delete=False,
                 suffix=f".{ext}",
-                prefix=f"ncm_{song_id}_",
+                prefix=f"qqm_{song_mid}_",
             )
             try:
                 written = 0
@@ -311,12 +317,12 @@ class NetEaseMusicPlugin(Star):
                 raise
             return tmp.name
 
-    def _prepare_voice_file(self, source_path: str, song_id: str) -> str:
+    def _prepare_voice_file(self, source_path: str, song_mid: str) -> str:
         ffmpeg = self._ensure_ffmpeg()
         out_file = tempfile.NamedTemporaryFile(
             delete=False,
             suffix=".mp3",
-            prefix=f"ncm_voice_{song_id}_",
+            prefix=f"qqm_voice_{song_mid}_",
         )
         out_path = out_file.name
         out_file.close()
@@ -387,14 +393,14 @@ class NetEaseMusicPlugin(Star):
             raise RuntimeError("ffmpeg 已下载但未能加入 PATH")
 
         self._ffmpeg_ready = True
-        logger.info(f"[ncmusic] ffmpeg ready: {ffmpeg_path}")
+        logger.info(f"[qqmusic] ffmpeg ready: {ffmpeg_path}")
         return ffmpeg_path
 
     def _get_imageio_ffmpeg_exe(self) -> str:
         try:
             import imageio_ffmpeg
         except ImportError:
-            logger.info("[ncmusic] 未找到 imageio-ffmpeg,尝试自动安装")
+            logger.info("[qqmusic] 未找到 imageio-ffmpeg,尝试自动安装")
             subprocess.run(
                 [
                     sys.executable,
@@ -436,11 +442,6 @@ class NetEaseMusicPlugin(Star):
             mode = shim_path.stat().st_mode
             shim_path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         return shim_path
-
-    @staticmethod
-    def _join_artists(artists: list[dict[str, Any]]) -> str:
-        names = [item.get("name", "") for item in artists if item.get("name")]
-        return ", ".join(names) if names else "未知"
 
     @staticmethod
     def _fmt_bytes(size: int) -> str:
@@ -489,7 +490,7 @@ class NetEaseMusicPlugin(Star):
     async def _try_send_qq_music_card(
         self,
         event: AstrMessageEvent,
-        song_id: str,
+        song_mid: str,
         title: str,
         artists: str,
         thumbnail: str,
@@ -508,7 +509,7 @@ class NetEaseMusicPlugin(Star):
             return
 
         client = event.bot
-        play_url = f"https://music.163.com/#/song?id={song_id}"
+        play_url = f"https://y.qq.com/n/ryqq/songDetail/{song_mid}"
         payload = [
             {
                 "type": "music",
@@ -516,7 +517,7 @@ class NetEaseMusicPlugin(Star):
                     "type": "custom",
                     "url": play_url,
                     "audio": audio_url or play_url,
-                    "title": title or "网易云音乐",
+                    "title": title or "QQ音乐",
                     "content": artists or "",
                     "image": thumbnail or "",
                 },
@@ -532,7 +533,7 @@ class NetEaseMusicPlugin(Star):
                     user_id=int(event.get_sender_id()), message=payload
                 )
         except Exception as e:
-            logger.debug(f"[ncmusic] QQ 自定义音乐卡片发送失败:{e}")
+            logger.debug(f"[qqmusic] QQ 自定义音乐卡片发送失败:{e}")
 
     @staticmethod
     def _fmt_duration(sec: int) -> str:
@@ -545,4 +546,4 @@ class NetEaseMusicPlugin(Star):
         return f"{m:02d}:{s:02d}"
 
     async def terminate(self):
-        logger.info("[ncmusic] 插件已卸载")
+        logger.info("[qqmusic] 插件已卸载")
